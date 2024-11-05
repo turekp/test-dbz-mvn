@@ -1,0 +1,21 @@
+# src/main/resources/application.yml
+spring:
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/testdb
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: test-group
+      auto-offset-reset: earliest
+debezium:
+  connectors:
+    mongodb:
+      connector.class: io.debezium.connector.mongodb.MongoDbConnector
+      mongodb.hosts: rs0/localhost:27017
+      mongodb.name: testdb
+      collection.include.list: testdb.event_outbox
+      field.renames: testdb.event_outbox.aggregateId:aggregate_id
+      key.converter: org.apache.kafka.connect.storage.StringConverter
+      value.converter: org.apache.kafka.connect.json.JsonConverter
+      partitioner.class: io.debezium.connector.mongodb.MongoDbConnector
