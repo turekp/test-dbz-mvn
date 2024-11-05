@@ -150,7 +150,7 @@ public class DebeziumMongoDbIntegrationTest {
             }
             String aggregateId = after.get("aggregateId").textValue();
             idToPartition.compute(UUID.fromString(aggregateId), (k, p) -> {
-                if (p!=null) assertEquals(p, next.partition(), "Partitions must be equal for " + aggregateId);
+                if (p!=null) assertEquals(p, next.partition(), "Partitions must be the same for any message related to " + aggregateId);
                 return next.partition();
             });
         }
