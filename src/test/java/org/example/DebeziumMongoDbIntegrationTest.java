@@ -99,8 +99,7 @@ public class DebeziumMongoDbIntegrationTest {
         catch (IOException e) {
             throw new RuntimeException("Error connecting to Debezium container", e);
         }
-        ConnectorConfiguration config = ConnectorConfiguration.forMongoDbContainer(mongoDBContainer);
-        debeziumContainer.registerConnector("mongo", config
+        ConnectorConfiguration config = ConnectorConfiguration.forMongoDbContainer(mongoDBContainer)
                 .with("tasks.max", "1")
                 .with("key.converter.schemas.enable", "false")
                 .with("value.converter.schemas.enable", "false")
@@ -114,8 +113,8 @@ public class DebeziumMongoDbIntegrationTest {
                 // -- proposed addons
                 .with("transforms", "outbox")
                 .with("transforms.outbox.type", "io.debezium.connector.mongodb.transforms.outbox.MongoEventRouter")
-                .with("transforms.outbox.collection.expand.json.payload","true")
-                .with("transforms.outbox.collection.field.event.key","aggregateId")
+                .with("transforms.outbox.collection.expand.json.payload", "true")
+                .with("transforms.outbox.collection.field.event.key", "aggregateId")
                 .with("transforms.outbox.route.by.field", "aggregateType")
                 // ... ignore value of aggregateType as we put all events in one topic
                 .with("transforms.outbox.route.topic.regex", "(.*)")
@@ -126,8 +125,8 @@ public class DebeziumMongoDbIntegrationTest {
                         "aggregateType:envelope,aggregateId:envelope,eventType:envelope,testAutomation:envelope,createdDate:envelope")
                 // --
                 .with("connector.class", "io.debezium.connector.mongodb.MongoDbConnector")
-                .with("mongodb.connection.string", mongoDbUri(mongoDBContainer.getClientAddress().toString()))
-        );
+                .with("mongodb.connection.string", mongoDbUri(mongoDBContainer.getClientAddress().toString()));
+        debeziumContainer.registerConnector("mongo", config);
     }
 
     private static @NotNull String mongoDbUri(String address) {
