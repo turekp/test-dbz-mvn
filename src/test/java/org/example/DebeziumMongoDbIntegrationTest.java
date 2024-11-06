@@ -5,12 +5,14 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.Maps;
 import io.debezium.testing.testcontainers.ConnectorConfiguration;
+import io.debezium.testing.testcontainers.DebeziumContainer;
 import io.debezium.testing.testcontainers.MongoDbContainer;
 import io.debezium.testing.testcontainers.util.PortResolver;
+import okhttp3.*;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.common.serialization.IntegerDeserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.bson.Document;
 import org.jetbrains.annotations.NotNull;
@@ -24,18 +26,17 @@ import org.springframework.kafka.test.utils.KafkaTestUtils;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
 import org.testcontainers.containers.KafkaContainer;
-import io.debezium.testing.testcontainers.DebeziumContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.shaded.com.fasterxml.jackson.databind.JsonDeserializer;
 
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.UUID;
+import java.io.IOException;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.*;
 import java.util.stream.IntStream;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 @SpringBootTest
@@ -68,12 +69,14 @@ public class DebeziumMongoDbIntegrationTest {
             .withNetworkAliases("mongo")
             .withNetwork(network);
 
+    public static final Integer PARTITIONS = 6;
+
     @Container
     static KafkaContainer kafkaContainer = new KafkaContainer()
             .withNetwork(network)
             .withEmbeddedZookeeper()
             .withNetworkAliases("kafka")
-            .withEnv("KAFKA_NUM_PARTITIONS", "3");
+            .withEnv("KAFKA_NUM_PARTITIONS", String.valueOf(PARTITIONS));
 
     @Container
     static DebeziumContainer debeziumContainer = new DebeziumContainer("debezium/connect:2.4.2.Final")
@@ -86,6 +89,16 @@ public class DebeziumMongoDbIntegrationTest {
     @BeforeAll
     static void setUp() {
         mongoDBContainer.initReplicaSet(false, mongoDBContainer.getNamedAddress());
+        String fullUrl = debeziumContainer.getTarget() + "/admin/loggers/io.debezium";
+        Request request = new Request.Builder().url(fullUrl).put(RequestBody.create("{ \"level\" : \"TRACE\" }", MediaType.get("application/json; charset=utf-8"))).build();
+        try (Response response = new OkHttpClient().newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                throw new IllegalStateException(response.message());
+            }
+        }
+        catch (IOException e) {
+            throw new RuntimeException("Error connecting to Debezium container", e);
+        }
         ConnectorConfiguration config = ConnectorConfiguration.forMongoDbContainer(mongoDBContainer);
         debeziumContainer.registerConnector("mongo", config
                 .with("tasks.max", "1")
@@ -98,10 +111,20 @@ public class DebeziumMongoDbIntegrationTest {
                 .with("database.include.list", "testdb")
                 .with("collection.include.list", "testdb.event_outbox")
                 .with("skipped.operations", "d")
-                .with("transforms", "dropPrefix")
-                .with("transforms.dropPrefix.type", "org.apache.kafka.connect.transforms.RegexRouter")
-                .with("transforms.dropPrefix.regex", "(.*)")
-                .with("transforms.dropPrefix.replacement", "event_outbox")
+                // -- proposed addons
+                .with("transforms", "outbox")
+                .with("transforms.outbox.type", "io.debezium.connector.mongodb.transforms.outbox.MongoEventRouter")
+                .with("transforms.outbox.collection.expand.json.payload","true")
+                .with("transforms.outbox.collection.field.event.key","aggregateId")
+                .with("transforms.outbox.route.by.field", "aggregateType")
+                // ... ignore value of aggregateType as we put all events in one topic
+                .with("transforms.outbox.route.topic.regex", "(.*)")
+                .with("transforms.outbox.route.topic.replacement", "event_outbox")
+                // ... add these fields to the message, otherwise it is just the value of payload
+                // ... this is a problem as we need to mirror the fields in the outbox collection which are not payload
+                .with("transforms.outbox.collection.fields.additional.placement",
+                        "aggregateType:envelope,aggregateId:envelope,eventType:envelope,testAutomation:envelope,createdDate:envelope")
+                // --
                 .with("connector.class", "io.debezium.connector.mongodb.MongoDbConnector")
                 .with("mongodb.connection.string", mongoDbUri(mongoDBContainer.getClientAddress().toString()))
         );
@@ -130,31 +153,42 @@ public class DebeziumMongoDbIntegrationTest {
         KafkaConsumer<String, String> consumer = (KafkaConsumer) new DefaultKafkaConsumerFactory<>(consumerProps).createConsumer();
         consumer.subscribe(Collections.singleton("event_outbox"));
 
-        int aggregates = 10;
+        int aggregates = 50;
         int messagesPerAggregate = 10;
         IntStream.range(0, aggregates).forEach(i -> {
             UUID currentUuid = UUID.randomUUID();
             IntStream.range(0, messagesPerAggregate).forEach(j -> {
-                mongoTemplate.remove(mongoTemplate.save(new Document(Map.of("aggregateId", currentUuid.toString(), "type", "test-event", "payload", "{}")), "event_outbox"), "event_outbox");
+                Map<String, ?> outboxEvent = Map.of(
+                        "aggregateId", currentUuid.toString(),
+                        "aggregateType", "test-event",
+                        "eventType", "CREATED",
+                        "testAutomation", "false",
+                        "createdDate", LocalDateTime.now().toString(),
+                        "payload", Map.of("field", "value")
+                );
+                Document saved = mongoTemplate.save(new Document(outboxEvent), "event_outbox");
+                mongoTemplate.remove(saved, "event_outbox");
             });
         });
 
         Map<UUID, Integer> idToPartition = Maps.newHashMap();
-        Iterator<ConsumerRecord<String, String>> record = KafkaTestUtils.getRecords(consumer).records("event_outbox").iterator();
+        ConsumerRecords<String, String> records = KafkaTestUtils.getRecords(consumer, Duration.ofSeconds(60));
+        Iterator<ConsumerRecord<String, String>> record = records.records("event_outbox").iterator();
         while (record.hasNext()) {
             ConsumerRecord<String, String> next = record.next();
             JsonNode node = objectMapper.readTree(next.value());
             JsonNode after = node.get("after");
-            if (after.isTextual()) {
+            if (after == null) {
+                after = node;
+            } else if (after.isTextual()) {
                 after = objectMapper.readTree(after.textValue());
             }
             String aggregateId = after.get("aggregateId").textValue();
-            idToPartition.compute(UUID.fromString(aggregateId), (k, p) -> {
-                if (p!=null) assertEquals(p, next.partition(), "Partitions must be the same for any message related to " + aggregateId);
-                return next.partition();
-            });
+            Integer p = idToPartition.put(UUID.fromString(aggregateId), next.partition());
+            if (p!=null) assertEquals(p, next.partition(), "Partitions must be the same for any message related to " + aggregateId);
         }
 
-        System.out.println(idToPartition);
+        assertThat(idToPartition.keySet()).as(() -> "must have received messages for aggregates").hasSize(aggregates);
+        assertThat(new HashSet<>(idToPartition.values())).as(() -> "must have spread messages across partitions").hasSize(PARTITIONS);
     }
 }
